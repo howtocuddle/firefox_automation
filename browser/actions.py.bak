@@ -1,0 +1,879 @@
+"""
+Browser Actions
+Handles interaction with page elements: click, type, scroll, etc.
+"""
+import os
+import time
+from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
+from ...safety import get_workspace_path
+from .core import get_driver
+from . import core # Import module to access mutable globals like _element_map
+from .helpers import human_click, human_type
+
+from selenium import webdriver
+
+def remove_overlays(driver):
+    """Injects JS to remove annoyance overlays."""
+    try:
+        js_path = os.path.join(os.path.dirname(__file__), "js", "overlays.js")
+        if os.path.exists(js_path):
+            with open(js_path, "r") as f:
+                js = f.read()
+            driver.execute_script(js)
+            # print("[DEBUG] Overlay script executed.")
+        else:
+            print(f"[Browser] Warning: Overlay script not found at {js_path}")
+    except Exception as e:
+        print(f"[Browser] Warning: Failed to remove overlays: {e}")
+
+def find_element_with_context(driver, selector):
+    """
+    Finds an element handling context switching (iframes, shadow roots).
+    Selector format: "iframe_selector >> shadow-root >> element_selector"
+    """
+    parts = [p.strip() for p in selector.split('>>')]
+    current_context = driver
+    
+    for i, part in enumerate(parts):
+        is_last = (i == len(parts) - 1)
+        
+        if part == "shadow-root":
+            # Switch to shadow root of the PREVIOUS element
+            # Note: Selenium doesn't "switch" to shadow root like a frame.
+            # We must have the host element from the previous step.
+            # But our loop structure means 'current_context' is the element from previous step.
+            if isinstance(current_context, webdriver.remote.webelement.WebElement):
+                current_context = current_context.shadow_root
+            else:
+                raise Exception("Cannot switch to shadow-root: previous context is not an element")
+            continue
+
+        # Find element in current context
+        element = None
+        
+        # 1. Try CSS
+        try:
+            element = current_context.find_element(By.CSS_SELECTOR, part)
+        except:
+            pass
+        
+        # 2. Try XPath (only if context is driver or element, not shadow root)
+        # ShadowRoot in Selenium 4+ supports find_element(By.CSS_SELECTOR) but NOT XPath usually
+        if not element and not isinstance(current_context, webdriver.remote.shadowroot.ShadowRoot):
+            try:
+                element = current_context.find_element(By.XPATH, part)
+            except:
+                pass
+        
+        # 3. Try Text/Attributes (Heuristic)
+        if not element and is_last:
+             # Only apply heuristics for the final target
+             # (Same heuristics as perform_action)
+             try:
+                 xpath = f"//*[contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), '{part.lower()}')]"
+                 if not isinstance(current_context, webdriver.remote.shadowroot.ShadowRoot):
+                     element = current_context.find_element(By.XPATH, xpath)
+             except:
+                 pass
+
+        if not element:
+            raise Exception(f"Could not find element: {part} in context {type(current_context)}")
+        
+        if not is_last:
+            # If this is an iframe, switch to it
+            if element.tag_name.lower() == 'iframe' or element.tag_name.lower() == 'frame':
+                driver.switch_to.frame(element)
+                current_context = driver # Reset context to driver (now inside frame)
+            else:
+                # It's a shadow host or just a container
+                current_context = element
+        else:
+            return element
+
+    return current_context
+
+def perform_action(action: str, payload: str = None) -> str:
+    driver = get_driver()
+    if not driver:
+        return "Error: Browser not open."
+
+    # Auto-remove overlays before any action
+    remove_overlays(driver)
+    
+    # Always switch to default content first to ensure we start from top
+    driver.switch_to.default_content()
+
+    if action == "find_element":
+        if not payload: return "Error: Text to find required."
+        
+        # JS to find element by text content
+        script = f"""
+        var text = "{payload.lower()}";
+        var elements = document.querySelectorAll('a, button, input, textarea, [role="button"]');
+        var found = [];
+        
+        for (var i=0; i<elements.length; i++) {{
+            var el = elements[i];
+            var elText = (el.innerText || el.value || el.getAttribute('aria-label') || el.getAttribute('title') || el.getAttribute('alt') || '').toLowerCase();
+            
+            if (elText.includes(text) && el.offsetParent !== null) {{
+                // Generate a unique selector
+                var selector = el.tagName.toLowerCase();
+                if (el.id) selector += '#' + el.id;
+                else if (el.className && typeof el.className === 'string') {{
+                    var classes = el.className.split(' ').filter(c => c.length > 0 && !c.includes(':'));
+                    if (classes.length > 0) selector += '.' + classes.slice(0, 2).join('.');
+                }}
+                
+                found.push({{
+                    tag: el.tagName,
+                    text: elText.substring(0, 50),
+                    selector: selector,
+                    rect: el.getBoundingClientRect()
+                }});
+            }}
+        }}
+        return found;
+        """
+        try:
+            results = driver.execute_script(script)
+            if not results:
+                return f"No elements found containing '{payload}'"
+            
+            output = [f"Found {len(results)} elements matching '{payload}':"]
+            for i, res in enumerate(results[:10]):
+                output.append(f"{i+1}. {res['tag']}: {res['text']} -> {res['selector']}")
+            
+            return "\\n".join(output)
+        except Exception as e:
+            return f"Error finding element: {e}"
+
+    elif action == "click":
+        if not payload: return "Error: Element to click required."
+        
+        expected_text = None
+        
+        # Resolve numeric index
+        if payload.isdigit():
+            index = int(payload)
+            if hasattr(core, '_element_map') and core._element_map and index in core._element_map:
+                element_info = core._element_map[index]
+                payload = element_info['selector']
+                expected_text = element_info.get('text', '').strip()
+            else:
+                return f"Error: Index {index} not found in element map."
+
+        try:
+            el = find_element_with_context(driver, payload)
+            
+            # Verify text match if we have an expectation (Safety Check for DOM Mismatch)
+            if expected_text:
+                current_text = (el.text or el.get_attribute('value') or el.get_attribute('aria-label') or '').strip()
+                # Simple heuristic: if expected text was non-empty and current text is different
+                # We allow partial matches because SoM text might be truncated
+                if expected_text and current_text:
+                    # Normalize
+                    t1 = expected_text.lower()[:20]
+                    t2 = current_text.lower()[:20]
+                    if t1 not in t2 and t2 not in t1:
+                        print(f"[Browser] Warning: DOM Mismatch for click. Expected '{expected_text}', found '{current_text}'")
+                        # We return error to force a refresh/snap
+                        return f"Error: DOM Mismatch. Element {index} text changed from '{expected_text}' to '{current_text}'. Please SNAP again."
+
+            # Human-like click
+            if human_click(el):
+                return f"Clicked {payload}"
+            else:
+                return f"Failed to click {payload} (human_click failed)"
+                
+        except Exception as e:
+            return f"Error clicking {payload}: {e}"
+
+    elif action == "hover":
+        if not payload: return "Error: Element to hover required."
+        
+        if payload.isdigit():
+            index = int(payload)
+            if hasattr(core, '_element_map') and core._element_map and index in core._element_map:
+                element_info = core._element_map[index]
+                payload = element_info['selector']
+
+        try:
+            el = find_element_with_context(driver, payload)
+            
+            action_chains = webdriver.ActionChains(driver)
+            action_chains.move_to_element(el).perform()
+            return f"Hovered over {payload}"
+        except Exception as e:
+            return f"Error hovering {payload}: {e}"
+
+    elif action == "focus":
+        if not payload: return "Error: Element to focus required."
+        
+        if payload.isdigit():
+            index = int(payload)
+            if hasattr(core, '_element_map') and core._element_map and index in core._element_map:
+                element_info = core._element_map[index]
+                payload = element_info['selector']
+
+        try:
+            el = find_element_with_context(driver, payload)
+            driver.execute_script("arguments[0].focus();", el)
+            return f"Focused {payload}"
+        except Exception as e:
+            return f"Error focusing {payload}: {e}"
+
+    elif action == "scroll":
+        # payload: "up", "down", "top", "bottom", or "element_selector"
+        if not payload: payload = "down"
+        
+        try:
+            if payload == "up":
+                driver.execute_script("window.scrollBy(0, -500);")
+                return "Scrolled up"
+            elif payload == "down":
+                driver.execute_script("window.scrollBy(0, 500);")
+                return "Scrolled down"
+            elif payload == "top":
+                driver.execute_script("window.scrollTo(0, 0);")
+                return "Scrolled to top"
+            elif payload == "bottom":
+                driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+                return "Scrolled to bottom"
+            else:
+                # Try scrolling to element
+                if payload.isdigit():
+                    index = int(payload)
+                    if hasattr(core, '_element_map') and core._element_map and index in core._element_map:
+                        element_info = core._element_map[index]
+                        payload = element_info['selector']
+                
+                el = find_element_with_context(driver, payload)
+                driver.execute_script("arguments[0].scrollIntoView({behavior: 'smooth', block: 'center'});", el)
+                return f"Scrolled to {payload}"
+        except Exception as e:
+            return f"Error scrolling: {e}"
+
+    elif action == "right_click":
+        if not payload: return "Error: Selector or index required."
+        
+        # Resolve numeric index
+        if payload.isdigit():
+            index = int(payload)
+            if hasattr(core, '_element_map') and core._element_map and index in core._element_map:
+                payload = core._element_map[index]['selector']
+        
+        try:
+            el = find_element_with_context(driver, payload)
+            # Scroll to element
+            driver.execute_script("arguments[0].scrollIntoView({behavior: 'smooth', block: 'center'});", el)
+            time.sleep(0.5)
+            
+            # Right click
+            actions = webdriver.ActionChains(driver)
+            actions.context_click(el).perform()
+            time.sleep(1.0) # Wait for menu
+            return f"Right-clicked {payload}"
+        except Exception as e:
+            return f"Error right-clicking: {e}"
+
+            try:
+                el = driver.find_element(By.LINK_TEXT, payload)
+            except:
+                pass
+                
+        # 3. Try Partial Link Text
+        if not el:
+            try:
+                el = driver.find_element(By.PARTIAL_LINK_TEXT, payload)
+            except:
+                pass
+        
+        # 4. Try XPath for text content
+        if not el:
+            try:
+                xpath = f"//*[contains(text(), '{payload}')]"
+                el = driver.find_element(By.XPATH, xpath)
+            except:
+                pass
+
+        if not el:
+             return f"Error: Could not find element to focus: {payload}"
+
+        # LEARN: If we found the element via fallback, generate and save robust XPath
+        if not cached_xpath:
+            try:
+                from .xpath_journal import extract_element_name, generate_robust_xpath, save_xpath
+                new_xpath = generate_robust_xpath(el, driver)
+                if new_xpath:
+                    # Try to get a semantic name (e.g. "Login") instead of just the selector
+                    # If payload was a number or selector, we prefer the extracted name
+                    semantic_name = extract_element_name(el)
+                    
+                    # If the payload looks like a name (not a selector/number), use it. 
+                    # Otherwise prefer the extracted semantic name.
+                    save_key = payload
+                    if not payload.isalpha() or len(payload) > 20: # Heuristic: payload is likely a selector or number
+                         save_key = semantic_name or payload
+                    
+                    if save_key:
+                        save_xpath(driver.current_url, save_key, new_xpath)
+            except Exception as e:
+                print(f"[Browser] Failed to learn XPath: {e}")
+
+        try:
+            # Scroll and Focus
+            driver.execute_script("arguments[0].scrollIntoView({behavior: 'smooth', block: 'center'});", el)
+            time.sleep(0.2)
+            driver.execute_script("arguments[0].focus();", el)
+            
+            result_msg = f"Focused {payload}"
+            
+            if chained_action == "ENTER":
+                time.sleep(0.2)
+                el.send_keys(Keys.ENTER)
+                result_msg += " and pressed ENTER"
+            elif chained_action == "CLICK":
+                time.sleep(0.2)
+                el.click()
+                result_msg += " and CLICKED"
+            elif chained_action == "RIGHT_CLICK":
+                time.sleep(0.2)
+                actions = webdriver.ActionChains(driver)
+                actions.context_click(el).perform()
+                result_msg += " and RIGHT CLICKED"
+            
+            return result_msg
+        except Exception as e:
+            return f"Error focusing: {e}"
+
+    elif action == "type":
+        if '|' not in payload: return "Error: 'selector|text'"
+        
+        # Check for optional ENTER flag
+        parts = payload.split('|')
+        if len(parts) == 3 and parts[2].strip().upper() == "ENTER":
+            sel, text, _ = parts
+            press_enter = True
+        else:
+            sel, text = parts[0], parts[1]
+            press_enter = False
+            
+        sel = sel.strip()
+        
+        # 0. Check XPath Journal first
+        from .xpath_journal import get_xpath, save_xpath, generate_robust_xpath, extract_element_name
+        cached_xpath = get_xpath(driver.current_url, sel)
+        if cached_xpath:
+            try:
+                print(f"[Browser] Using cached XPath for '{sel}': {cached_xpath}")
+                el = driver.find_element(By.XPATH, cached_xpath)
+                if human_type(el, text):
+                    if press_enter:
+                        time.sleep(0.5)
+                        el.send_keys(Keys.ENTER)
+                        return f"✓ Typed '{text}' into {sel} (via cached XPath)"
+                    return f"✓ Typed '{text}' into {sel} (via cached XPath)"
+            except Exception as e:
+                print(f"[Browser] Cached XPath failed: {e}")
+                # Fall through to normal search logic
+
+        # Resolve numeric index to selector if possible
+        if sel.isdigit():
+            index = int(sel)
+            if hasattr(core, '_element_map') and core._element_map and index in core._element_map:
+                element_info = core._element_map[index]
+                print(f"[Browser] Type target found in map: {index} -> {element_info.get('tag')} ({element_info.get('selector')})")
+                sel = element_info['selector']
+            else:
+                return f"Error: Index {index} not found in element map."
+
+        try:
+            el = None
+            
+            # Use new context-aware finder
+            try:
+                el = find_element_with_context(driver, sel)
+            except Exception as e:
+                # print(f"Context find failed: {e}")
+                pass
+
+            # Fallback to old heuristics if simple selector and context find failed
+            if not el and ">>" not in sel:
+                # 1. Try finding input/textarea by attributes (id, name, placeholder, aria-label)
+                # CRITICAL: Exclude submit/button/hidden/image inputs to avoid typing into buttons (like Google's btnK)
+                try:
+                    # Case-insensitive partial match for placeholder/aria-label often helps
+                    # We strictly filter out non-text types
+                    xpath = f"//input[(not(@type) or @type='text' or @type='search' or @type='email' or @type='password' or @type='url' or @type='tel' or @type='number') and (contains(translate(@id, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), '{sel.lower()}') or contains(translate(@name, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), '{sel.lower()}') or contains(translate(@placeholder, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), '{sel.lower()}') or contains(translate(@aria-label, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), '{sel.lower()}'))]"
+                    el = driver.find_element(By.XPATH, xpath)
+                except:
+                    pass
+            
+                # 2. Try textarea if input failed
+                if not el:
+                    try:
+                        xpath = f"//textarea[contains(translate(@id, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), '{sel.lower()}') or contains(translate(@name, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), '{sel.lower()}') or contains(translate(@placeholder, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), '{sel.lower()}') or contains(translate(@aria-label, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), '{sel.lower()}')]"
+                        el = driver.find_element(By.XPATH, xpath)
+                    except:
+                        pass
+                
+                # 3. Try contenteditable elements (divs, spans)
+                if not el:
+                     try:
+                        xpath = f"//*[@contenteditable='true' and (contains(translate(@aria-label, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), '{sel.lower()}') or contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), '{sel.lower()}'))]"
+                        el = driver.find_element(By.XPATH, xpath)
+                     except:
+                        pass
+            
+            # 4. Last resort: If selector is "search" or "q", try generic search box
+            if not el and sel.lower() in ["search", "q", "query"]:
+                try:
+                    el = driver.find_element(By.NAME, "q")
+                except:
+                    pass
+
+            if not el:
+                return f"✗ Error: Could not find element '{sel}' to type into. Tried CSS, ID, Name, Placeholder, Aria-Label."
+
+            # LEARN: If we found the element via fallback, generate and save robust XPath
+            if not cached_xpath:
+                try:
+                    new_xpath = generate_robust_xpath(el, driver)
+                    if new_xpath:
+                        # Try to get a semantic name (e.g. "Search") instead of just the selector
+                        semantic_name = extract_element_name(el)
+                        
+                        # If the selector looks like a name (not a CSS selector), use it.
+                        # Otherwise prefer the extracted semantic name.
+                        save_key = sel
+                        if not sel.isalpha() or len(sel) > 20: # Heuristic
+                            save_key = semantic_name or sel
+                        
+                        if save_key:
+                            save_xpath(driver.current_url, save_key, new_xpath)
+                except Exception as e:
+                    print(f"[Browser] Failed to learn XPath: {e}")
+            if human_type(el, text):
+                # Press Enter if requested
+                if press_enter:
+                    time.sleep(0.5)
+                    el.send_keys(Keys.ENTER)
+                    return f"✓ Typed '{text}' and pressed ENTER into {sel}"
+                
+                # Verify the value was set
+                final_value = el.get_attribute('value') or el.text or ''
+                return f"✓ Successfully typed '{text}' into {sel}. Current value: '{final_value}'"
+            else:
+                return f"✗ Error: Failed to type into {sel}"
+        except Exception as e:
+            return f"✗ Error finding element '{sel}' to type: {e}"
+
+    elif action == "fill_form":
+        try:
+            import json
+            form_data = json.loads(payload)
+            results = []
+            for selector, value in form_data.items():
+                # Reuse type logic for each field
+                res = perform_action("type", f"{selector}|{value}")
+                results.append(f"{selector}: {res}")
+            return "\\n".join(results)
+        except Exception as e:
+            return f"Error filling form: {e}"
+
+    elif action == "form_fill":
+        if '|' not in payload: return "Error: 'selector|text'"
+        sel, text = payload.split('|', 1)
+        try:
+            el = driver.find_element(By.CSS_SELECTOR, sel.strip())
+            # Ensure element is visible and clear it
+            driver.execute_script("arguments[0].scrollIntoView({behavior: 'smooth', block: 'center'});", el)
+            time.sleep(0.5)
+            el.clear()
+            
+            if human_type(el, text):
+                return f"Filled form field {sel} with '{text}'"
+            else:
+                return f"Error filling form field {sel}"
+        except Exception as e:
+            return f"Error filling form: {e}"
+
+    elif action == "upload_file":
+        if '|' not in payload: return "Error: 'selector|filepath'"
+        sel, filepath = payload.split('|', 1)
+        filepath = filepath.strip()
+        
+        if not os.path.exists(filepath):
+            return f"Error: File not found at {filepath}"
+            
+        try:
+            el = driver.find_element(By.CSS_SELECTOR, sel.strip())
+            el.send_keys(filepath)
+            return f"Uploaded {filepath} to {sel}"
+        except Exception as e:
+            return f"Error uploading file: {e}"
+
+    elif action == "check_downloads":
+        # List files in download directory
+        download_dir = get_workspace_path()
+        try:
+            files = sorted(os.listdir(download_dir), key=lambda x: os.path.getmtime(os.path.join(download_dir, x)), reverse=True)
+            if not files:
+                return "No files in download directory."
+            
+            result = "Downloads:\n"
+            for f in files[:10]: # Top 10 recent
+                path = os.path.join(download_dir, f)
+                size = os.path.getsize(path)
+                result += f"- {f} ({size} bytes)\n"
+            return result
+        except Exception as e:
+            return f"Error checking downloads: {e}"
+
+    elif action == "scroll":
+        # Get current scroll position
+        start_scroll = driver.execute_script("return window.pageYOffset;")
+        
+        if payload == "bottom":
+            driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+        elif payload == "top":
+            driver.execute_script("window.scrollTo(0, 0);")
+        else:
+            driver.execute_script("window.scrollBy(0, 500);")
+        
+        time.sleep(0.5)
+        end_scroll = driver.execute_script("return window.pageYOffset;")
+        
+        if start_scroll == end_scroll and payload != "top":
+            return "End of page reached. Cannot scroll further."
+        return "Scrolled."
+
+    elif action == "quick_find":
+        # Firefox Quick Find (Text)
+        try:
+            text = payload.get("text", "")
+            body = driver.find_element(By.TAG_NAME, "body")
+            body.send_keys("/")
+            time.sleep(0.2)
+            body.send_keys(text)
+            return f"Used Quick Find for '{text}'"
+        except Exception as e:
+            return f"Error using Quick Find: {e}"
+
+    elif action == "quick_link":
+        # Firefox Quick Find (Links only)
+        try:
+            text = payload.get("text", "")
+            body = driver.find_element(By.TAG_NAME, "body")
+            body.send_keys("'")
+            time.sleep(0.2)
+            body.send_keys(text)
+            return f"Used Quick Link for '{text}'"
+        except Exception as e:
+            return f"Error using Quick Link: {e}"
+
+    elif action == "press_key":
+        if not payload: return "Error: Key name required (e.g., 'space', 'enter', 'ctrl+t', 'f5')."
+        
+        payload_lower = payload.lower()
+        
+        # Special browser commands that need direct execution
+        # These don't work well with normal key sending, so we use JS/driver methods
+        if payload_lower == "ctrl+t":
+            # Open new tab
+            try:
+                driver.execute_script("window.open('', '_blank');")
+                time.sleep(0.5)
+                driver.switch_to.window(driver.window_handles[-1])
+                return "Opened new tab and switched to it"
+            except Exception as e:
+                return f"Error opening new tab: {e}"
+        
+        elif payload_lower == "ctrl+w":
+            # Close current tab
+            try:
+                if len(driver.window_handles) > 1:
+                    driver.close()
+                    driver.switch_to.window(driver.window_handles[0])
+                    return "Closed current tab"
+                else:
+                    return "Cannot close the only tab"
+            except Exception as e:
+                return f"Error closing tab: {e}"
+        
+        elif payload_lower in ["ctrl+r", "f5"]:
+            # Refresh page
+            try:
+                driver.refresh()
+                time.sleep(1)
+                return "Refreshed page"
+            except Exception as e:
+                return f"Error refreshing: {e}"
+        
+        elif payload_lower in ["ctrl+shift+r", "ctrl+f5", "shift+f5"]:
+            # Hard refresh (clear cache)
+            try:
+                driver.execute_script("location.reload(true);")
+                time.sleep(1)
+                return "Hard refreshed page (cleared cache)"
+            except Exception as e:
+                return f"Error hard refreshing: {e}"
+        
+        elif payload_lower in ["backspace", "alt+left"]:
+            # Go back
+            try:
+                driver.back()
+                time.sleep(1)
+                return "Navigated back"
+            except Exception as e:
+                return f"Error going back: {e}"
+        
+        elif payload_lower == "alt+right":
+            # Go forward
+            try:
+                driver.forward()
+                time.sleep(1)
+                return "Navigated forward"
+            except Exception as e:
+                return f"Error going forward: {e}"
+        
+        elif payload_lower == "ctrl+l":
+            # Focus address bar
+            try:
+                driver.execute_script("window.location.href = window.location.href;")
+                body = driver.find_element(By.TAG_NAME, "body")
+                body.send_keys(Keys.CONTROL + "l")
+                return "Focused address bar"
+            except Exception as e:
+                return f"Error focusing address bar: {e}"
+        
+        elif payload_lower == "ctrl+plus" or payload_lower == "ctrl+=":
+            # Zoom in
+            try:
+                driver.execute_script("document.body.style.zoom = (parseFloat(document.body.style.zoom || 1) + 0.1);")
+                return "Zoomed in"
+            except Exception as e:
+                return f"Error zooming in: {e}"
+        
+        elif payload_lower == "ctrl+minus" or payload_lower == "ctrl+-":
+            # Zoom out
+            try:
+                driver.execute_script("document.body.style.zoom = (parseFloat(document.body.style.zoom || 1) - 0.1);")
+                return "Zoomed out"
+            except Exception as e:
+                return f"Error zooming out: {e}"
+        
+        elif payload_lower == "ctrl+0":
+            # Reset zoom
+            try:
+                driver.execute_script("document.body.style.zoom = 1;")
+                return "Reset zoom to 100%"
+            except Exception as e:
+                return f"Error resetting zoom: {e}"
+        
+        elif payload_lower == "f11":
+            # Fullscreen toggle
+            try:
+                driver.fullscreen_window()
+                return "Toggled fullscreen"
+            except Exception as e:
+                return f"Error toggling fullscreen: {e}"
+        
+        elif payload_lower == "ctrl+shift+t":
+            # Reopen last closed tab (not really possible in Selenium, simulate with message)
+            return "Ctrl+Shift+T (reopen closed tab) - Note: Not supported in automation. Recommend opening URL directly."
+        
+        elif payload_lower == "ctrl+tab":
+            # Switch to next tab
+            try:
+                handles = driver.window_handles
+                current = driver.current_window_handle
+                current_idx = handles.index(current)
+                next_idx = (current_idx + 1) % len(handles)
+                driver.switch_to.window(handles[next_idx])
+                return f"Switched to next tab ({next_idx + 1}/{len(handles)})"
+            except Exception as e:
+                return f"Error switching tabs: {e}"
+        
+        elif payload_lower == "ctrl+shift+tab":
+            # Switch to previous tab
+            try:
+                handles = driver.window_handles
+                current = driver.current_window_handle
+                current_idx = handles.index(current)
+                prev_idx = (current_idx - 1) % len(handles)
+                driver.switch_to.window(handles[prev_idx])
+                return f"Switched to previous tab ({prev_idx + 1}/{len(handles)})"
+            except Exception as e:
+                return f"Error switching tabs: {e}"
+        
+        elif payload_lower == "ctrl+d":
+            # Bookmark (not applicable in automation)
+            return "Ctrl+D (bookmark) - Not applicable in automated browsing"
+        
+        elif payload_lower == "ctrl+f" or payload_lower == "f3":
+            # Find in page - use browser's native find
+            try:
+                body = driver.find_element(By.TAG_NAME, "body")
+                body.send_keys(Keys.CONTROL + "f")
+                return "Opened find dialog (Ctrl+F)"
+            except Exception as e:
+                return f"Error opening find: {e}"
+        
+        elif payload_lower == "ctrl+g":
+            # Find next
+            try:
+                body = driver.find_element(By.TAG_NAME, "body")
+                body.send_keys(Keys.CONTROL + "g")
+                return "Find next (Ctrl+G)"
+            except Exception as e:
+                return f"Error find next: {e}"
+        
+        elif payload_lower == "ctrl+h":
+            # History (open history sidebar - not useful in automation)
+            return "Ctrl+H (history) - Not useful in automated browsing"
+        
+        elif payload_lower == "ctrl+u":
+            # View page source
+            try:
+                driver.execute_script("window.open('view-source:' + window.location.href, '_blank');")
+                time.sleep(0.5)
+                driver.switch_to.window(driver.window_handles[-1])
+                return "Opened page source in new tab"
+            except Exception as e:
+                return f"Error viewing source: {e}"
+        
+        elif payload_lower == "ctrl+shift+i":
+            # Developer tools (not controllable via Selenium)
+            return "Ctrl+Shift+I (dev tools) - Cannot be controlled via automation"
+        
+        elif payload_lower == "ctrl+s":
+            # Save page
+            try:
+                body = driver.find_element(By.TAG_NAME, "body")
+                body.send_keys(Keys.CONTROL + "s")
+                time.sleep(0.5)
+                return "Triggered save page dialog (Ctrl+S)"
+            except Exception as e:
+                return f"Error saving page: {e}"
+        
+        elif payload_lower == "ctrl+p":
+            # Print
+            try:
+                driver.execute_script("window.print();")
+                time.sleep(0.5)
+                return "Opened print dialog (Ctrl+P)"
+            except Exception as e:
+                return f"Error opening print dialog: {e}"
+        
+        elif payload_lower == "ctrl+shift+delete":
+            # Clear browsing data (cannot automate)
+            return "Ctrl+Shift+Delete (clear data) - Cannot be automated. Use driver.delete_all_cookies() instead."
+        
+        elif payload_lower == "escape":
+            # Exit fullscreen or close dialogs
+            try:
+                body = driver.find_element(By.TAG_NAME, "body")
+                body.send_keys(Keys.ESCAPE)
+                return "Pressed Escape"
+            except Exception as e:
+                return f"Error pressing Escape: {e}"
+        
+        # Standard key mapping for other keys
+        key_map = {
+            "space": Keys.SPACE,
+            "enter": Keys.ENTER,
+            "return": Keys.RETURN,
+            "tab": Keys.TAB,
+            "escape": Keys.ESCAPE,
+            "backspace": Keys.BACKSPACE,
+            "delete": Keys.DELETE,
+            "left": Keys.LEFT,
+            "right": Keys.RIGHT,
+            "up": Keys.UP,
+            "down": Keys.DOWN,
+            "page_up": Keys.PAGE_UP,
+            "page_down": Keys.PAGE_DOWN,
+            "home": Keys.HOME,
+            "end": Keys.END,
+            "k": "k",
+            "j": "j",
+            "l": "l",
+            "f": "f",
+            "t": "t",
+            "w": "w",
+            "ctrl": Keys.CONTROL,
+            "control": Keys.CONTROL,
+            "alt": Keys.ALT,
+            "shift": Keys.SHIFT,
+            "cmd": Keys.COMMAND,
+            "meta": Keys.META,
+        }
+        
+        try:
+            # Parse key combination
+            keys_to_press = []
+            parts = payload_lower.split('+')
+            
+            for part in parts:
+                part = part.strip()
+                if part in key_map:
+                    keys_to_press.append(key_map[part])
+                elif len(part) == 1:
+                    keys_to_press.append(part)
+                else:
+                    return f"Error: Unknown key '{part}'"
+            
+            # Send keys to body element (more reliable than ActionChains for shortcuts)
+            body = driver.find_element(By.TAG_NAME, "body")
+            
+            # Build chord string for send_keys
+            if len(keys_to_press) == 1:
+                # Single key
+                body.send_keys(keys_to_press[0])
+            else:
+                # Key chord (e.g., Ctrl+K)
+                chord_keys = keys_to_press[:-1]  # All modifier keys
+                final_key = keys_to_press[-1]     # The letter/action key
+                
+                # Build chord
+                chord = "".join(chord_keys) + final_key
+                body.send_keys(chord)
+            
+            return f"Pressed keys: {payload}"
+            
+        except Exception as e:
+            return f"Error pressing keys: {e}"
+
+
+    elif action == "quick_find":
+        if not payload: return "Error: Text to find required."
+        
+        # Check for links_only flag (format: "text|links_only")
+        links_only = False
+        text = payload
+        if "|" in payload:
+            parts = payload.split("|")
+            text = parts[0]
+            if len(parts) > 1 and parts[1].strip().lower() == "true":
+                links_only = True
+        
+        try:
+            # Firefox Quick Find shortcuts
+            # / = Quick Find (text)
+            # ' = Quick Find (links only)
+            trigger_key = "'" if links_only else "/"
+            
+            actions = webdriver.ActionChains(driver)
+            actions.send_keys(trigger_key).perform()
+            time.sleep(0.2)
+            actions.send_keys(text).perform()
+            
+            mode_str = "Links only" if links_only else "Text"
+            return f"Quick Find ({mode_str}): Typed '{text}'. Check screenshot for highlights."
+        except Exception as e:
+            return f"Error performing Quick Find: {e}"
+
+    return None
